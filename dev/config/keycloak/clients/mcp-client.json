@@ -9,5 +9,5 @@
   "redirectUris": ["*"],
   "webOrigins": ["*"],
   "defaultClientScopes": ["profile", "email"],
-  "optionalClientScopes": ["mcp-server"]
+  "optionalClientScopes": ["mcp-server", "mcp:openshift"]
 }

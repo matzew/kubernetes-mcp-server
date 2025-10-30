@@ -1,0 +1,27 @@
+# RBAC ClusterRoleBinding for mcp user with OIDC authentication on OpenShift
+#
+# IMPORTANT: This requires OpenShift to be configured with OIDC:
+#
+# Configure Authentication CR with:
+#   spec.oidcProviders[].issuer.issuerURL: https://keycloak.example.com/realms/openshift
+#   spec.oidcProviders[].issuer.audiences: ["openshift", "mcp-server"]
+#   spec.oidcProviders[].claimMappings.username.claim: preferred_username
+#   spec.oidcProviders[].claimMappings.username.prefixPolicy: NoPrefix
+#
+# Without OIDC configuration, this binding will not work.
+#
+# To configure OpenShift Authentication:
+#   make openshift-configure-authentication KEYCLOAK_URL=https://keycloak.example.com
+#
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oidc-mcp-cluster-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: mcp

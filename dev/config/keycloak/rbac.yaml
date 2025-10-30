@@ -6,6 +6,8 @@
 #
 # Without OIDC configuration, this binding will not work.
 #
+# For OpenShift clusters, see dev/config/openshift/rbac.yaml instead.
+#
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
