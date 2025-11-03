@@ -394,6 +394,35 @@ else
 fi
 
 echo ""
+echo "Adding 'sub' claim mapper to mcp-server client..."
+echo "  This is REQUIRED for cross-realm token exchange"
+
+MCP_SUB_MAPPER_RESPONSE=$(curl $CURL_OPTS -w "HTTPCODE:%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/openshift/clients/$MCP_CLIENT_ID/protocol-mappers/models" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "name": "sub",
+      "protocol": "openid-connect",
+      "protocolMapper": "oidc-sub-mapper",
+      "consentRequired": false,
+      "config": {
+        "id.token.claim": "true",
+        "access.token.claim": "true",
+        "userinfo.token.claim": "true"
+      }
+    }')
+
+MCP_SUB_MAPPER_CODE=$(echo "$MCP_SUB_MAPPER_RESPONSE" | grep -o "HTTPCODE:[0-9]*" | cut -d: -f2)
+
+if [ "$MCP_SUB_MAPPER_CODE" = "201" ] || [ "$MCP_SUB_MAPPER_CODE" = "409" ]; then
+    if [ "$MCP_SUB_MAPPER_CODE" = "201" ]; then echo "✅ Sub claim mapper added to mcp-server client"
+    else echo "✅ Sub claim mapper already exists on mcp-server client"; fi
+else
+    echo "❌ Failed to create sub claim mapper (HTTP $MCP_SUB_MAPPER_CODE)"
+    echo "WARNING: Cross-realm token exchange requires the 'sub' claim in tokens!"
+fi
+
+echo ""
 echo "Creating test user mcp/mcp..."
 
 USER_RESPONSE=$(curl $CURL_OPTS -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/openshift/users" \

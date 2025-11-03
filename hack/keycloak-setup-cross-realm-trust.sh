@@ -110,8 +110,9 @@ if [ "$IDP_EXISTS" = "200" ]; then
   "firstBrokerLoginFlowAlias": "first broker login",
   "config": {
     "issuer": "$HUB_KEYCLOAK_ISSUER",
-    "validateSignature": "false",
-    "useJwksUrl": "false",
+    "validateSignature": "true",
+    "useJwksUrl": "true",
+    "jwksUrl": "$HUB_KEYCLOAK_ISSUER/protocol/openid-connect/certs",
     "tokenUrl": "$HUB_KEYCLOAK_ISSUER/protocol/openid-connect/token",
     "authorizationUrl": "$HUB_KEYCLOAK_ISSUER/protocol/openid-connect/auth",
     "userInfoUrl": "$HUB_KEYCLOAK_ISSUER/protocol/openid-connect/userinfo",
@@ -141,8 +142,9 @@ else
   "firstBrokerLoginFlowAlias": "first broker login",
   "config": {
     "issuer": "$HUB_KEYCLOAK_ISSUER",
-    "validateSignature": "false",
-    "useJwksUrl": "false",
+    "validateSignature": "true",
+    "useJwksUrl": "true",
+    "jwksUrl": "$HUB_KEYCLOAK_ISSUER/protocol/openid-connect/certs",
     "tokenUrl": "$HUB_KEYCLOAK_ISSUER/protocol/openid-connect/token",
     "authorizationUrl": "$HUB_KEYCLOAK_ISSUER/protocol/openid-connect/auth",
     "userInfoUrl": "$HUB_KEYCLOAK_ISSUER/protocol/openid-connect/userinfo",
@@ -160,10 +162,11 @@ echo ""
 echo "Step 5: Enabling token exchange for $MANAGED_CLIENT_ID..."
 
 # Update the client attributes to allow token exchange from hub IDP
+# Note: subject.audience must match the 'aud' claim in the hub's tokens
 UPDATED_CONFIG=$(echo "$CURRENT_CONFIG" | jq \
   --arg idp "$IDP_ALIAS" \
   '.attributes["token.exchange.subject.issuer"] = $idp |
-   .attributes["token.exchange.subject.audience"] = "openshift"')
+   .attributes["token.exchange.subject.audience"] = "mcp-server"')
 
 curl -sk -X PUT \
   "$MANAGED_KEYCLOAK_URL/admin/realms/$MANAGED_REALM/clients/$CLIENT_UUID" \
@@ -196,6 +199,92 @@ fi
 
 echo -e "${GREEN}✅ Permissions configured${NC}"
 
+# Step 7: Create federated identity link
+echo ""
+echo "Step 7: Creating federated identity link..."
+
+# This requires credentials to get a token from the hub to extract the user ID
+if [ -n "${HUB_CLIENT_SECRET:-}" ] && [ -n "${MCP_USERNAME:-}" ] && [ -n "${MCP_PASSWORD:-}" ]; then
+  echo "Getting hub user ID from token..."
+
+  # Get a test token from the hub to extract the sub claim (user ID)
+  HUB_TOKEN_RESPONSE=$(curl -sk -X POST "$HUB_KEYCLOAK_ISSUER/protocol/openid-connect/token" \
+    -d "grant_type=password" \
+    -d "client_id=$MANAGED_CLIENT_ID" \
+    -d "client_secret=$HUB_CLIENT_SECRET" \
+    -d "username=${MCP_USERNAME}" \
+    -d "password=${MCP_PASSWORD}" 2>/dev/null)
+
+  HUB_TOKEN=$(echo "$HUB_TOKEN_RESPONSE" | jq -r '.access_token // empty')
+
+  if [ -n "$HUB_TOKEN" ] && [ "$HUB_TOKEN" != "null" ]; then
+    # Extract sub claim from token
+    HUB_USER_ID=$(echo "$HUB_TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq -r '.sub // empty')
+
+    if [ -n "$HUB_USER_ID" ] && [ "$HUB_USER_ID" != "null" ]; then
+      echo "Hub user ID: $HUB_USER_ID"
+
+      # Get managed cluster user
+      MANAGED_USER_RESPONSE=$(curl -sk -X GET \
+        "$MANAGED_KEYCLOAK_URL/admin/realms/$MANAGED_REALM/users?username=${MCP_USERNAME}&exact=true" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json")
+
+      MANAGED_USER_ID=$(echo "$MANAGED_USER_RESPONSE" | jq -r '.[0].id // empty')
+
+      if [ -n "$MANAGED_USER_ID" ] && [ "$MANAGED_USER_ID" != "null" ]; then
+        echo "Managed user ID: $MANAGED_USER_ID"
+
+        # Check if federated identity already exists
+        FED_ID_EXISTS=$(curl -sk -X GET \
+          "$MANAGED_KEYCLOAK_URL/admin/realms/$MANAGED_REALM/users/$MANAGED_USER_ID/federated-identity/$IDP_ALIAS" \
+          -H "Authorization: Bearer $TOKEN" \
+          -w "%{http_code}" -o /dev/null)
+
+        if [ "$FED_ID_EXISTS" = "200" ]; then
+          echo -e "${YELLOW}⚠️  Federated identity link already exists${NC}"
+        else
+          # Create federated identity link
+          CREATE_LINK_RESPONSE=$(curl -sk -X POST \
+            "$MANAGED_KEYCLOAK_URL/admin/realms/$MANAGED_REALM/users/$MANAGED_USER_ID/federated-identity/$IDP_ALIAS" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -w "\n%{http_code}" \
+            -d "{
+              \"identityProvider\": \"$IDP_ALIAS\",
+              \"userId\": \"$HUB_USER_ID\",
+              \"userName\": \"${MCP_USERNAME}\"
+            }")
+
+          HTTP_CODE=$(echo "$CREATE_LINK_RESPONSE" | tail -n1)
+
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo -e "${GREEN}✅ Federated identity link created${NC}"
+          else
+            echo -e "${YELLOW}⚠️  Failed to create federated identity link (HTTP $HTTP_CODE)${NC}"
+            echo "This link is required for token exchange to work."
+          fi
+        fi
+      else
+        echo -e "${YELLOW}⚠️  User ${MCP_USERNAME} not found in managed cluster${NC}"
+        echo "Please create the user before setting up federated identity."
+      fi
+    else
+      echo -e "${YELLOW}⚠️  Hub token missing 'sub' claim${NC}"
+      echo "Please ensure the hub's $MANAGED_CLIENT_ID client includes a 'sub' claim mapper."
+    fi
+  else
+    echo -e "${YELLOW}⚠️  Failed to get hub token${NC}"
+    echo "Cannot create federated identity link without hub user ID."
+  fi
+else
+  echo -e "${YELLOW}⚠️  Skipping federated identity link creation${NC}"
+  echo "To create the federated identity link, provide:"
+  echo "  - HUB_CLIENT_SECRET"
+  echo "  - MCP_USERNAME (default: mcp)"
+  echo "  - MCP_PASSWORD"
+fi
+
 echo ""
 echo "========================================="
 echo -e "${GREEN}✅ Cross-realm token exchange setup complete!${NC}"
@@ -210,4 +299,11 @@ echo "  Identity Provider: $IDP_ALIAS"
 echo ""
 echo "The managed cluster's Keycloak is now configured to accept"
 echo "tokens from the hub's Keycloak via token exchange."
+echo ""
+echo "Next steps:"
+echo "  1. Ensure hub's CA certificate is added to managed cluster:"
+echo "     ./hack/add-hub-ca-to-keycloak.sh"
+echo "  2. Ensure hub's $MANAGED_CLIENT_ID client has 'sub' claim mapper"
+echo "  3. Test token exchange with:"
+echo "     subject_token_type=urn:ietf:params:oauth:token-type:jwt"
 echo ""

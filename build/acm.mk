@@ -1,7 +1,7 @@
 # ACM (Advanced Cluster Management) installation targets for OpenShift
 # This file is specific to downstream OpenShift/OCP features only
 
-.PHONY: acm-install acm-mce-install acm-operator-install acm-instance-install acm-status acm-import-cluster acm-uninstall acm-setup-cross-realm-trust
+.PHONY: acm-install acm-mce-install acm-operator-install acm-instance-install acm-status acm-import-cluster acm-uninstall acm-setup-cross-realm-trust acm-add-hub-ca
 
 ##@ ACM (OpenShift only)
 
@@ -251,3 +251,33 @@ acm-setup-cross-realm-trust: ## Configure cross-realm token exchange trust for a
 	MANAGED_REALM="openshift" \
 	MANAGED_CLIENT_ID="mcp-server" \
 	bash ./hack/keycloak-setup-cross-realm-trust.sh
+
+# Add hub CA certificate to managed cluster's Keycloak truststore
+# Usage: make acm-add-hub-ca MANAGED_KUBECONFIG=<path>
+acm-add-hub-ca: ## Add hub CA certificate to managed cluster Keycloak
+	@if [ -z "$(MANAGED_KUBECONFIG)" ]; then \
+		echo "Error: MANAGED_KUBECONFIG is required"; \
+		echo "Usage: make acm-add-hub-ca MANAGED_KUBECONFIG=<path>"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(MANAGED_KUBECONFIG)" ]; then \
+		echo "Error: Kubeconfig file not found: $(MANAGED_KUBECONFIG)"; \
+		exit 1; \
+	fi
+	@echo "==========================================="
+	@echo "Adding Hub CA to Managed Cluster Keycloak"
+	@echo "==========================================="
+	@echo ""
+	@echo "Step 1: Getting hub Keycloak issuer URL..."
+	@HUB_KEYCLOAK_ISSUER=$$(oc get route -n keycloak keycloak -o jsonpath='https://{.spec.host}/realms/openshift' 2>/dev/null); \
+	if [ -z "$$HUB_KEYCLOAK_ISSUER" ]; then \
+		echo "❌ Error: Hub Keycloak route not found"; \
+		echo "   Make sure you have KUBECONFIG set to the hub cluster"; \
+		exit 1; \
+	fi; \
+	echo "✅ Hub Keycloak issuer: $$HUB_KEYCLOAK_ISSUER"; \
+	echo ""; \
+	echo "Step 2: Running hub CA setup script..."; \
+	KUBECONFIG="$(MANAGED_KUBECONFIG)" \
+	HUB_KEYCLOAK_ISSUER="$$HUB_KEYCLOAK_ISSUER" \
+	bash ./hack/add-hub-ca-to-keycloak.sh
