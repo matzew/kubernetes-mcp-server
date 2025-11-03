@@ -32,6 +32,21 @@ type Manager struct {
 
 	staticConfig         *config.StaticConfig
 	CloseWatchKubeConfig CloseWatchKubeConfig
+
+	// Token exchange configuration for ACM managed clusters
+	// When set, Derived() will perform token exchange before creating the derived config
+	tokenExchangeConfig *tokenExchangeConfig
+}
+
+// tokenExchangeConfig holds OAuth token exchange configuration
+type tokenExchangeConfig struct {
+	tokenURL         string
+	clientID         string
+	clientSecret     string
+	subjectIssuer    string
+	audience         string
+	subjectTokenType string
+	caFile           string // CA certificate file for TLS verification
 }
 
 var _ helm.Kubernetes = (*Manager)(nil)
@@ -242,6 +257,22 @@ func (m *Manager) Derived(ctx context.Context) (*Kubernetes, error) {
 		return &Kubernetes{manager: m}, nil
 	}
 	klog.V(5).Infof("%s header found (Bearer), using provided bearer token", OAuthAuthorizationHeader)
+
+	// Extract the bearer token
+	bearerToken := strings.TrimPrefix(authorization, "Bearer ")
+
+	// Perform token exchange if configured for this manager (ACM managed cluster)
+	if m.tokenExchangeConfig != nil {
+		klog.V(4).Infof("Performing token exchange (issuer: %s, url: %s)",
+			m.tokenExchangeConfig.subjectIssuer, m.tokenExchangeConfig.tokenURL)
+		exchangedToken, err := performTokenExchange(ctx, *m.tokenExchangeConfig, bearerToken)
+		if err != nil {
+			return nil, fmt.Errorf("token exchange failed: %w", err)
+		}
+		bearerToken = exchangedToken
+		klog.V(4).Info("Token exchange successful")
+	}
+
 	derivedCfg := &rest.Config{
 		Host:    m.cfg.Host,
 		APIPath: m.cfg.APIPath,
@@ -252,7 +283,7 @@ func (m *Manager) Derived(ctx context.Context) (*Kubernetes, error) {
 			CAFile:     m.cfg.CAFile,
 			CAData:     m.cfg.CAData,
 		},
-		BearerToken: strings.TrimPrefix(authorization, "Bearer "),
+		BearerToken: bearerToken,
 		// pass custom UserAgent to identify the client
 		UserAgent:   CustomUserAgent,
 		QPS:         m.cfg.QPS,

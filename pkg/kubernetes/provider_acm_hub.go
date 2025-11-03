@@ -2,9 +2,14 @@ package kubernetes
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
 	authenticationv1api "k8s.io/api/authentication/v1"
@@ -58,12 +63,32 @@ func (c *ACMProviderConfig) ResolveClusterProxyAddonCAFilePath(ctx context.Conte
 	c.ClusterProxyAddonCAFile = filepath.Join(path, c.ClusterProxyAddonCAFile)
 }
 
+// ClusterTokenExchangeConfig holds token exchange configuration for a specific managed cluster
+type ClusterTokenExchangeConfig struct {
+	// TokenURL is the token endpoint for the managed cluster's Keycloak
+	TokenURL string `toml:"token_url,omitempty"`
+	// ClientID is the OAuth client ID for token exchange
+	ClientID string `toml:"client_id,omitempty"`
+	// ClientSecret is the OAuth client secret for token exchange
+	ClientSecret string `toml:"client_secret,omitempty"`
+	// SubjectIssuer is the identity provider alias in the managed cluster (e.g., "hub-openshift")
+	SubjectIssuer string `toml:"subject_issuer,omitempty"`
+	// Audience is the target audience for the exchanged token
+	Audience string `toml:"audience,omitempty"`
+	// SubjectTokenType is the type of the subject token (jwt or access_token)
+	// Should be "urn:ietf:params:oauth:token-type:jwt" for JWKS validation
+	SubjectTokenType string `toml:"subject_token_type,omitempty"`
+}
+
 type ACMKubeConfigProviderConfig struct {
 	ACMProviderConfig
 
 	// Name of the context in the kubeconfig file to look for acm access credentials in.
 	// Should point to the "hub" cluster.
 	ContextName string `toml:"context_name,omitempty"`
+
+	// Clusters holds per-cluster token exchange configuration
+	Clusters map[string]ClusterTokenExchangeConfig `toml:"clusters,omitempty"`
 }
 
 func (c *ACMKubeConfigProviderConfig) Validate() error {
@@ -106,6 +131,9 @@ type acmHubClusterProvider struct {
 	skipTLSVerify      bool
 	clusterProxyCAFile string
 	watchKubeConfig    bool // whether or not the kubeconfig should be watched for changes
+
+	// Token exchange configuration for managed clusters
+	clusterTokenExchangeConfigs map[string]ClusterTokenExchangeConfig
 
 	// Context for cancelling the watch goroutine
 	watchCtx     context.Context
@@ -167,7 +195,7 @@ func newACMHubClusterProvider(cfg *config.StaticConfig) (Provider, error) {
 		return nil, fmt.Errorf("missing required config for strategy '%s'", ClusterProviderACM)
 	}
 
-	return newACMClusterProvider(m, providerCfg.(*ACMProviderConfig), false)
+	return newACMClusterProvider(m, providerCfg.(*ACMProviderConfig), false, nil)
 }
 
 func newACMKubeConfigClusterProvider(cfg *config.StaticConfig) (Provider, error) {
@@ -186,7 +214,7 @@ func newACMKubeConfigClusterProvider(cfg *config.StaticConfig) (Provider, error)
 		)
 	}
 
-	return newACMClusterProvider(baseManager, &acmKubeConfigProviderCfg.ACMProviderConfig, true)
+	return newACMClusterProvider(baseManager, &acmKubeConfigProviderCfg.ACMProviderConfig, true, acmKubeConfigProviderCfg.Clusters)
 }
 
 func discoverClusterProxyHost(m *Manager, isOpenShift bool) (string, error) {
@@ -227,7 +255,7 @@ func discoverClusterProxyHost(m *Manager, isOpenShift bool) (string, error) {
 	return "", fmt.Errorf("failed to auto-discover cluster-proxy host: route and service not found")
 }
 
-func newACMClusterProvider(m *Manager, cfg *ACMProviderConfig, watchKubeConfig bool) (Provider, error) {
+func newACMClusterProvider(m *Manager, cfg *ACMProviderConfig, watchKubeConfig bool, clusterTokenExchangeConfigs map[string]ClusterTokenExchangeConfig) (Provider, error) {
 	if !m.IsACMHub() {
 		return nil, fmt.Errorf("not deployed in an ACM hub cluster")
 	}
@@ -249,14 +277,15 @@ func newACMClusterProvider(m *Manager, cfg *ACMProviderConfig, watchKubeConfig b
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 
 	provider := &acmHubClusterProvider{
-		hubManager:         m,
-		clusterManagers:    make(map[string]*Manager),
-		watchKubeConfig:    watchKubeConfig,
-		watchCtx:           watchCtx,
-		watchCancel:        watchCancel,
-		clusterProxyHost:   clusterProxyHost,
-		clusterProxyCAFile: cfg.ClusterProxyAddonCAFile,
-		skipTLSVerify:      cfg.ClusterProxyAddonSkipTLSVerify,
+		hubManager:                  m,
+		clusterManagers:             make(map[string]*Manager),
+		watchKubeConfig:             watchKubeConfig,
+		watchCtx:                    watchCtx,
+		watchCancel:                 watchCancel,
+		clusterProxyHost:            clusterProxyHost,
+		clusterProxyCAFile:          cfg.ClusterProxyAddonCAFile,
+		skipTLSVerify:               cfg.ClusterProxyAddonSkipTLSVerify,
+		clusterTokenExchangeConfigs: clusterTokenExchangeConfigs,
 	}
 
 	ctx := context.Background()
@@ -432,6 +461,103 @@ func (p *acmHubClusterProvider) refreshClusters(ctx context.Context) error {
 	return nil
 }
 
+// performTokenExchange performs OAuth 2.0 token exchange according to RFC 8693
+// with support for Keycloak V1 token exchange (subject_issuer parameter)
+func performTokenExchange(ctx context.Context, config tokenExchangeConfig, subjectToken string) (string, error) {
+	if config.tokenURL == "" {
+		return "", fmt.Errorf("token_url not configured for token exchange")
+	}
+
+	klog.V(4).Infof("Performing token exchange with %s (subject_issuer: %s, subject_token_type: %s)",
+		config.tokenURL, config.subjectIssuer, config.subjectTokenType)
+
+	// Default values for subject_token_type if not specified
+	subjectTokenType := config.subjectTokenType
+	if subjectTokenType == "" {
+		subjectTokenType = "urn:ietf:params:oauth:token-type:jwt"
+	}
+
+	// Prepare form data for token exchange
+	data := url.Values{}
+	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+	data.Set("client_id", config.clientID)
+	data.Set("client_secret", config.clientSecret)
+	data.Set("subject_token", subjectToken)
+	data.Set("subject_token_type", subjectTokenType)
+	data.Set("requested_token_type", "urn:ietf:params:oauth:token-type:access_token")
+
+	// Add V1 token exchange parameters
+	if config.subjectIssuer != "" {
+		data.Set("subject_issuer", config.subjectIssuer)
+	}
+	if config.audience != "" {
+		data.Set("audience", config.audience)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "POST", config.tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("failed to create token exchange request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	// Create HTTP client with TLS configuration
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// Configure TLS if CA file is provided
+	if config.caFile != "" {
+		tlsConfig, err := rest.TLSConfigFor(&rest.Config{
+			TLSClientConfig: rest.TLSClientConfig{
+				CAFile: config.caFile,
+			},
+		})
+		if err != nil {
+			return "", fmt.Errorf("failed to create TLS config: %w", err)
+		}
+		client.Transport = &http.Transport{
+			TLSClientConfig: tlsConfig,
+		}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("token exchange request failed: %w", err)
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			klog.V(3).Infof("Failed to close response body: %v", closeErr)
+		}
+	}()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read token exchange response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		klog.V(3).Infof("Token exchange failed (HTTP %d): %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("token exchange failed with HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the response
+	var tokenResponse struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+
+	if err := json.Unmarshal(body, &tokenResponse); err != nil {
+		return "", fmt.Errorf("failed to parse token exchange response: %w", err)
+	}
+
+	if tokenResponse.AccessToken == "" {
+		return "", fmt.Errorf("token exchange response missing access_token")
+	}
+
+	klog.V(4).Infof("Token exchange successful (expires_in: %d seconds)", tokenResponse.ExpiresIn)
+	return tokenResponse.AccessToken, nil
+}
+
 func (p *acmHubClusterProvider) managerForCluster(cluster string) (*Manager, error) {
 	if manager, exists := p.clusterManagers[cluster]; exists && manager != nil {
 		return manager, nil
@@ -478,6 +604,21 @@ func (p *acmHubClusterProvider) managerForCluster(cluster string) (*Manager, err
 		cfg:             proxyConfig,
 		staticConfig:    p.hubManager.staticConfig,
 		clientCmdConfig: clientcmd.NewDefaultClientConfig(*proxyRawConfig, nil),
+	}
+
+	// Configure token exchange for this managed cluster if configured
+	if clusterTokenConfig, hasConfig := p.clusterTokenExchangeConfigs[cluster]; hasConfig {
+		manager.tokenExchangeConfig = &tokenExchangeConfig{
+			tokenURL:         clusterTokenConfig.TokenURL,
+			clientID:         clusterTokenConfig.ClientID,
+			clientSecret:     clusterTokenConfig.ClientSecret,
+			subjectIssuer:    clusterTokenConfig.SubjectIssuer,
+			audience:         clusterTokenConfig.Audience,
+			subjectTokenType: clusterTokenConfig.SubjectTokenType,
+			caFile:           p.hubManager.staticConfig.CertificateAuthority,
+		}
+		klog.V(3).Infof("Token exchange configured for cluster %s (issuer: %s, token_url: %s, ca_file: %s)",
+			cluster, clusterTokenConfig.SubjectIssuer, clusterTokenConfig.TokenURL, p.hubManager.staticConfig.CertificateAuthority)
 	}
 
 	if err := p.initializeManager(manager); err != nil {
