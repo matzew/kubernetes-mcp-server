@@ -7,9 +7,16 @@ set -eo pipefail
 #   - .keycloak-config/hub-config.env
 #   - .keycloak-config/clusters/*.env
 #
-# And generates: acm-kubeconfig.toml
+# And generates: _output/acm-kubeconfig.toml
 
-OUTPUT_FILE="acm-kubeconfig.toml"
+# Get script directory and repo root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Create _output directory if it doesn't exist
+mkdir -p "$REPO_ROOT/_output"
+
+OUTPUT_FILE="$REPO_ROOT/_output/acm-kubeconfig.toml"
 
 echo "==========================================="
 echo "Generating acm-kubeconfig.toml"

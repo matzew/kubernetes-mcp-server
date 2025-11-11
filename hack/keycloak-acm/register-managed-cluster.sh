@@ -1,0 +1,487 @@
+#!/bin/bash
+set -euo pipefail
+
+# ACM Managed Cluster Registration Script (Declarative)
+# This script registers a managed cluster realm and configures cross-realm token exchange
+#
+# Required environment variables:
+#   CLUSTER_NAME           - Name of the managed cluster (e.g., managed-cluster-one)
+#   HUB_KUBECONFIG         - Path to hub cluster kubeconfig
+#   MANAGED_KUBECONFIG     - Path to managed cluster kubeconfig
+#
+# Optional environment variables:
+#   KEYCLOAK_CA_CERT       - Path to CA certificate for HTTPS verification (optional)
+
+# Validate required variables
+: "${CLUSTER_NAME:?Error: CLUSTER_NAME environment variable is required}"
+: "${HUB_KUBECONFIG:?Error: HUB_KUBECONFIG environment variable is required}"
+: "${MANAGED_KUBECONFIG:?Error: MANAGED_KUBECONFIG environment variable is required}"
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+KEYCLOAK_CONFIG_DIR="$REPO_ROOT/dev/config/openshift/keycloak"
+HUB_CONFIG_ENV="$REPO_ROOT/.keycloak-config/hub-config.env"
+CLUSTER_CONFIG_DIR="$REPO_ROOT/.keycloak-config/clusters"
+
+# Load hub configuration
+if [ ! -f "$HUB_CONFIG_ENV" ]; then
+    echo "❌ Hub configuration not found at $HUB_CONFIG_ENV"
+    echo "Please run ./hack/acm/acm-keycloak-setup-hub-declarative.sh first"
+    exit 1
+fi
+
+source "$HUB_CONFIG_ENV"
+
+# Set curl options based on CA cert availability
+CURL_OPTS="-sk"
+if [ -n "${KEYCLOAK_CA_CERT:-}" ]; then
+    CURL_OPTS="--cacert $KEYCLOAK_CA_CERT"
+fi
+
+MANAGED_REALM="$CLUSTER_NAME"
+IDP_ALIAS="hub-realm"
+
+echo "========================================="
+echo "ACM Managed Cluster Registration (Declarative)"
+echo "========================================="
+echo "Cluster Name: $CLUSTER_NAME"
+echo "Managed Realm: $MANAGED_REALM"
+echo "Hub Realm: $HUB_REALM"
+echo "Keycloak URL: $KEYCLOAK_URL"
+echo ""
+
+# Step 1: Get admin token
+echo "Step 1: Getting admin access token..."
+RESPONSE=$(curl $CURL_OPTS -X POST "$KEYCLOAK_URL/realms/master/protocol/openid-connect/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "username=$ADMIN_USER" \
+    -d "password=$ADMIN_PASSWORD" \
+    -d "grant_type=password" \
+    -d "client_id=admin-cli")
+
+ADMIN_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // empty' 2>/dev/null)
+
+if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
+    echo "❌ Failed to get access token"
+    exit 1
+fi
+
+echo "  ✅ Admin token obtained"
+echo ""
+
+# Step 2: Create managed cluster realm
+echo "Step 2: Creating managed cluster realm..."
+REALM_JSON=$(cat "$KEYCLOAK_CONFIG_DIR/realm/managed-realm-create.json" | sed "s/\"managed-cluster-one\"/\"$MANAGED_REALM\"/")
+REALM_RESPONSE=$(curl $CURL_OPTS -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$REALM_JSON")
+
+REALM_CODE=$(echo "$REALM_RESPONSE" | tail -c 4)
+
+if [ "$REALM_CODE" = "201" ]; then
+    echo "  ✅ Managed realm created"
+elif [ "$REALM_CODE" = "409" ]; then
+    echo "  ✅ Managed realm already exists"
+else
+    echo "  ❌ Failed to create managed realm (HTTP $REALM_CODE)"
+    exit 1
+fi
+echo ""
+
+# Step 3: Create client scopes
+echo "Step 3: Creating client scopes in managed realm..."
+
+SCOPE_RESPONSE=$(curl $CURL_OPTS -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/client-scopes" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @"$KEYCLOAK_CONFIG_DIR/client-scopes/openid.json")
+
+SCOPE_CODE=$(echo "$SCOPE_RESPONSE" | tail -c 4)
+if [ "$SCOPE_CODE" = "201" ] || [ "$SCOPE_CODE" = "409" ]; then
+    echo "  ✅ openid scope created/exists"
+fi
+
+SCOPE_RESPONSE=$(curl $CURL_OPTS -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/client-scopes" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @"$KEYCLOAK_CONFIG_DIR/client-scopes/mcp-server.json")
+
+SCOPE_CODE=$(echo "$SCOPE_RESPONSE" | tail -c 4)
+if [ "$SCOPE_CODE" = "201" ] || [ "$SCOPE_CODE" = "409" ]; then
+    echo "  ✅ mcp-server scope created/exists"
+fi
+echo ""
+
+# Step 4: Add protocol mappers to mcp-server scope
+echo "Step 4: Adding protocol mappers..."
+
+SCOPES_LIST=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/client-scopes" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")
+MCP_SERVER_SCOPE_ID=$(echo "$SCOPES_LIST" | jq -r '.[] | select(.name == "mcp-server") | .id // empty')
+
+MAPPER_RESPONSE=$(curl $CURL_OPTS -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/client-scopes/$MCP_SERVER_SCOPE_ID/protocol-mappers/models" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @"$KEYCLOAK_CONFIG_DIR/mappers/mcp-server-audience-mapper.json")
+
+MAPPER_CODE=$(echo "$MAPPER_RESPONSE" | tail -c 4)
+if [ "$MAPPER_CODE" = "201" ] || [ "$MAPPER_CODE" = "409" ]; then
+    echo "  ✅ mcp-server audience mapper added"
+fi
+echo ""
+
+# Step 5: Create mcp-server client in managed realm
+echo "Step 5: Creating mcp-server client in managed realm..."
+
+CLIENT_RESPONSE=$(curl $CURL_OPTS -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/clients" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @"$KEYCLOAK_CONFIG_DIR/clients/mcp-server.json")
+
+CLIENT_CODE=$(echo "$CLIENT_RESPONSE" | tail -c 4)
+if [ "$CLIENT_CODE" = "201" ] || [ "$CLIENT_CODE" = "409" ]; then
+    echo "  ✅ mcp-server client created/exists"
+fi
+echo ""
+
+# Step 6: Get managed mcp-server client UUID and secret
+echo "Step 6: Retrieving managed cluster client details..."
+
+CLIENTS_LIST=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/clients" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")
+
+MANAGED_CLIENT_UUID=$(echo "$CLIENTS_LIST" | jq -r '.[] | select(.clientId == "mcp-server") | .id')
+MANAGED_SECRET_RESPONSE=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/clients/$MANAGED_CLIENT_UUID/client-secret" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")
+MANAGED_CLIENT_SECRET=$(echo "$MANAGED_SECRET_RESPONSE" | jq -r '.value')
+
+echo "  ✅ Managed mcp-server UUID: $MANAGED_CLIENT_UUID"
+echo ""
+
+# Step 7: Create identity provider pointing to hub realm
+echo "Step 7: Creating identity provider (hub realm)..."
+
+IDP_JSON=$(cat "$KEYCLOAK_CONFIG_DIR/identity-providers/hub-realm-idp-template.json" | \
+    sed "s|\${KEYCLOAK_URL}|$KEYCLOAK_URL|g" | \
+    sed "s|\${HUB_CLIENT_SECRET}|$CLIENT_SECRET|g" | \
+    sed "s/\"hub-realm\"/\"$IDP_ALIAS\"/")
+
+IDP_RESPONSE=$(curl $CURL_OPTS -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/identity-provider/instances" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$IDP_JSON")
+
+IDP_CODE=$(echo "$IDP_RESPONSE" | tail -c 4)
+
+if [ "$IDP_CODE" = "201" ]; then
+    echo "  ✅ Identity provider created"
+elif [ "$IDP_CODE" = "409" ]; then
+    echo "  ✅ Identity provider already exists"
+    # Update existing IDP
+    curl $CURL_OPTS -X PUT "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/identity-provider/instances/$IDP_ALIAS" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$IDP_JSON" > /dev/null
+    echo "  ✅ Identity provider updated"
+else
+    echo "  ❌ Failed to create identity provider (HTTP $IDP_CODE)"
+    exit 1
+fi
+echo ""
+
+# Step 8: Create federated identity link
+echo "Step 8: Creating federated identity link..."
+
+# Get hub user ID
+HUB_USERS=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$HUB_REALM/users?username=$MCP_USERNAME" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")
+HUB_USER_ID=$(echo "$HUB_USERS" | jq -r '.[0].id // empty')
+
+if [ -z "$HUB_USER_ID" ]; then
+    echo "  ❌ Hub user $MCP_USERNAME not found"
+    exit 1
+fi
+
+# Get or create managed user
+MANAGED_USERS=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/users?username=$MCP_USERNAME" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")
+MANAGED_USER_ID=$(echo "$MANAGED_USERS" | jq -r '.[0].id // empty')
+
+if [ -z "$MANAGED_USER_ID" ] || [ "$MANAGED_USER_ID" = "null" ]; then
+    # Create user in managed realm
+    USER_JSON=$(cat "$KEYCLOAK_CONFIG_DIR/users/mcp.json" | sed "s/\"mcp\"/\"$MCP_USERNAME\"/")
+    USER_RESPONSE=$(curl $CURL_OPTS -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/users" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$USER_JSON")
+
+    USER_CODE=$(echo "$USER_RESPONSE" | tail -c 4)
+    if [ "$USER_CODE" = "201" ]; then
+        MANAGED_USERS=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/users?username=$MCP_USERNAME" \
+            -H "Authorization: Bearer $ADMIN_TOKEN")
+        MANAGED_USER_ID=$(echo "$MANAGED_USERS" | jq -r '.[0].id')
+        echo "  ✅ Managed user created"
+    fi
+fi
+
+# Create federated identity link
+FED_IDENTITY_JSON="{
+  \"identityProvider\": \"$IDP_ALIAS\",
+  \"userId\": \"$HUB_USER_ID\",
+  \"userName\": \"$MCP_USERNAME\"
+}"
+
+FED_RESPONSE=$(curl $CURL_OPTS -w "%{http_code}" -X POST "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/users/$MANAGED_USER_ID/federated-identity/$IDP_ALIAS" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$FED_IDENTITY_JSON")
+
+FED_CODE=$(echo "$FED_RESPONSE" | tail -c 4)
+if [ "$FED_CODE" = "204" ] || [ "$FED_CODE" = "409" ]; then
+    echo "  ✅ Federated identity link created (hub user: $HUB_USER_ID → managed user: $MANAGED_USER_ID)"
+else
+    echo "  ⚠️  Federated identity link returned HTTP $FED_CODE"
+fi
+echo ""
+
+# Step 9: Configure cross-realm token exchange permissions
+echo "Step 9: Configuring cross-realm token exchange permissions..."
+
+# Enable fine-grained permissions on IDP
+curl $CURL_OPTS -X PUT "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/identity-provider/instances/$IDP_ALIAS/management/permissions" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"enabled": true}' > /dev/null
+
+# Get IDP permissions
+IDP_PERMS=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/identity-provider/instances/$IDP_ALIAS/management/permissions" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")
+TOKEN_EXCHANGE_PERM_ID=$(echo "$IDP_PERMS" | jq -r '.scopePermissions."token-exchange"')
+
+# Get realm-management client ID
+REALM_MGMT_ID=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/clients?clientId=realm-management" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.[0].id')
+
+# Create client policy for managed mcp-server
+POLICY_RESPONSE=$(curl $CURL_OPTS -X POST "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/clients/$REALM_MGMT_ID/authz/resource-server/policy/client" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"type\": \"client\",
+      \"logic\": \"POSITIVE\",
+      \"decisionStrategy\": \"UNANIMOUS\",
+      \"name\": \"allow-mcp-server-token-exchange\",
+      \"description\": \"Allow hub realm mcp-server to exchange to managed cluster\",
+      \"clients\": [\"$MANAGED_CLIENT_UUID\"]
+    }" 2>/dev/null)
+
+POLICY_ID=$(echo "$POLICY_RESPONSE" | jq -r '.id // empty')
+
+# If policy creation failed, try to find existing policy
+if [ -z "$POLICY_ID" ] || [ "$POLICY_ID" = "null" ]; then
+    ALL_POLICIES=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/clients/$REALM_MGMT_ID/authz/resource-server/policy?type=client" \
+        -H "Authorization: Bearer $ADMIN_TOKEN")
+    POLICY_ID=$(echo "$ALL_POLICIES" | jq -r '.[] | select(.name == "allow-mcp-server-token-exchange") | .id')
+fi
+
+# Link policy to token-exchange permission
+CURRENT_PERM=$(curl $CURL_OPTS -X GET "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/clients/$REALM_MGMT_ID/authz/resource-server/permission/$TOKEN_EXCHANGE_PERM_ID" \
+    -H "Authorization: Bearer $ADMIN_TOKEN")
+
+UPDATED_PERM=$(echo "$CURRENT_PERM" | jq --arg policy_id "$POLICY_ID" '. + {policies: [$policy_id]}')
+
+curl $CURL_OPTS -X PUT "$KEYCLOAK_URL/admin/realms/$MANAGED_REALM/clients/$REALM_MGMT_ID/authz/resource-server/permission/$TOKEN_EXCHANGE_PERM_ID" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$UPDATED_PERM" > /dev/null
+
+echo "  ✅ Cross-realm token exchange configured"
+echo ""
+
+# Step 10: Save configuration
+echo "Step 10: Saving configuration..."
+
+mkdir -p "$CLUSTER_CONFIG_DIR"
+cat > "$CLUSTER_CONFIG_DIR/$CLUSTER_NAME.env" <<EOF
+# Managed Cluster Configuration: $CLUSTER_NAME
+# Generated: $(date -Iseconds)
+
+CLUSTER_NAME="$CLUSTER_NAME"
+MANAGED_REALM="$MANAGED_REALM"
+IDP_ALIAS="$IDP_ALIAS"
+CLIENT_ID="mcp-server"
+CLIENT_SECRET="$MANAGED_CLIENT_SECRET"
+CLIENT_UUID="$MANAGED_CLIENT_UUID"
+
+MCP_USERNAME="$MCP_USERNAME"
+MCP_PASSWORD="$MCP_PASSWORD"
+
+HUB_REALM="$HUB_REALM"
+HUB_USER_ID="$HUB_USER_ID"
+MANAGED_USER_ID="$MANAGED_USER_ID"
+EOF
+
+echo "  ✅ Configuration saved to $CLUSTER_CONFIG_DIR/$CLUSTER_NAME.env"
+echo ""
+
+#=============================================================================
+# Configure OIDC Authentication on Managed Cluster
+#=============================================================================
+echo "========================================="
+echo "Configuring OIDC on Managed Cluster"
+echo "========================================="
+echo ""
+
+# Step 1: Enable TechPreviewNoUpgrade feature gate
+echo "Step 1: Enabling TechPreviewNoUpgrade feature gate on managed cluster..."
+CURRENT_FEATURE_SET=$(kubectl --kubeconfig="$MANAGED_KUBECONFIG" get featuregate cluster -o jsonpath='{.spec.featureSet}' 2>/dev/null || echo "")
+if [ "$CURRENT_FEATURE_SET" != "TechPreviewNoUpgrade" ]; then
+    kubectl --kubeconfig="$MANAGED_KUBECONFIG" patch featuregate cluster \
+        --type=merge -p='{"spec":{"featureSet":"TechPreviewNoUpgrade"}}'
+    echo "  ✅ TechPreviewNoUpgrade enabled"
+    echo "  ⚠️  Control plane will restart (10-15 minutes)"
+    echo "  ⚠️  Waiting 2 minutes for initial rollout..."
+    sleep 120
+else
+    echo "  ✅ TechPreviewNoUpgrade already enabled"
+fi
+
+echo ""
+echo "Waiting for kube-apiserver on managed cluster..."
+for i in $(seq 1 30); do
+    if kubectl --kubeconfig="$MANAGED_KUBECONFIG" wait --for=condition=Available --timeout=10s clusteroperator/kube-apiserver 2>/dev/null; then
+        echo "  ✅ kube-apiserver is ready"
+        break
+    fi
+    echo "  Waiting for kube-apiserver (attempt $i/30)..."
+    sleep 10
+done
+
+# Step 2: Create Keycloak CA certificate ConfigMap
+echo ""
+echo "Step 2: Creating Keycloak CA certificate ConfigMap..."
+KEYCLOAK_CA=$(kubectl --kubeconfig="$HUB_KUBECONFIG" get configmap router-ca -n keycloak \
+    -o jsonpath='{.data.router-ca\.crt}' 2>/dev/null || \
+    kubectl --kubeconfig="$HUB_KUBECONFIG" get configmap -n openshift-config-managed default-ingress-cert \
+    -o jsonpath='{.data.ca-bundle\.crt}' 2>/dev/null)
+
+if [ -z "$KEYCLOAK_CA" ]; then
+    echo "  ⚠️  Could not extract Keycloak CA certificate"
+    echo "  You may need to manually create ConfigMap: keycloak-oidc-ca in openshift-config"
+else
+    echo "$KEYCLOAK_CA" | kubectl --kubeconfig="$MANAGED_KUBECONFIG" create configmap keycloak-oidc-ca \
+        -n openshift-config --from-file=ca-bundle.crt=/dev/stdin --dry-run=client -o yaml | \
+        kubectl --kubeconfig="$MANAGED_KUBECONFIG" apply -f -
+    echo "  ✅ CA certificate ConfigMap created"
+fi
+
+# Step 3: Create RBAC for service-account-mcp-server user
+echo ""
+echo "Step 3: Creating RBAC for service-account-mcp-server user..."
+kubectl --kubeconfig="$MANAGED_KUBECONFIG" create clusterrolebinding svc-acct-mcp-server-admin \
+    --clusterrole=cluster-admin --user=service-account-mcp-server \
+    --dry-run=client -o yaml | kubectl --kubeconfig="$MANAGED_KUBECONFIG" apply -f -
+echo "  ✅ RBAC created"
+
+# Step 4: Configure OIDC provider
+echo ""
+echo "Step 4: Configuring OIDC provider..."
+ISSUER_URL="$KEYCLOAK_URL/realms/$MANAGED_REALM"
+
+CURRENT_ISSUER=$(kubectl --kubeconfig="$MANAGED_KUBECONFIG" get authentication.config.openshift.io/cluster \
+    -o jsonpath='{.spec.oidcProviders[0].issuer.issuerURL}' 2>/dev/null || echo "")
+
+if [ "$CURRENT_ISSUER" = "$ISSUER_URL" ]; then
+    echo "  ✅ OIDC provider already configured"
+else
+    if [ -n "$CURRENT_ISSUER" ]; then
+        echo "  Updating existing OIDC provider..."
+        printf '[{"op":"replace","path":"/spec/oidcProviders/0/issuer/issuerURL","value":"%s"},{"op":"replace","path":"/spec/oidcProviders/0/issuer/audiences","value":["mcp-server"]}]' "$ISSUER_URL" > /tmp/oidc-patch-$CLUSTER_NAME.json
+    else
+        echo "  Creating new OIDC provider..."
+        printf '[{"op":"remove","path":"/spec/webhookTokenAuthenticator"},{"op":"replace","path":"/spec/type","value":"OIDC"},{"op":"add","path":"/spec/oidcProviders","value":[{"name":"keycloak","issuer":{"issuerURL":"%s","audiences":["mcp-server"],"issuerCertificateAuthority":{"name":"keycloak-oidc-ca"}},"claimMappings":{"username":{"claim":"preferred_username","prefixPolicy":"NoPrefix"}}}]}]' "$ISSUER_URL" > /tmp/oidc-patch-$CLUSTER_NAME.json
+    fi
+
+    kubectl --kubeconfig="$MANAGED_KUBECONFIG" patch authentication.config.openshift.io/cluster \
+        --type=json -p="$(cat /tmp/oidc-patch-$CLUSTER_NAME.json)"
+    echo "  ✅ OIDC provider configured"
+    echo ""
+    echo "  Verifying kube-apiserver operator picked up OIDC configuration..."
+
+    # Get current revision before verification
+    BEFORE_REV=$(kubectl --kubeconfig="$MANAGED_KUBECONFIG" get kubeapiserver cluster \
+        -o jsonpath='{.status.latestAvailableRevision}' 2>/dev/null || echo "0")
+
+    # Wait up to 2 minutes for a new revision to be created
+    echo "  Waiting for new kube-apiserver revision to be created..."
+    for i in $(seq 1 24); do
+        sleep 5
+        CURRENT_REV=$(kubectl --kubeconfig="$MANAGED_KUBECONFIG" get kubeapiserver cluster \
+            -o jsonpath='{.status.latestAvailableRevision}' 2>/dev/null || echo "0")
+        if [ "$CURRENT_REV" -gt "$BEFORE_REV" ]; then
+            echo "  ✅ New revision $CURRENT_REV created"
+            break
+        fi
+        if [ $i -eq 24 ]; then
+            echo "  ⚠️  No new revision created after 2 minutes"
+            echo "  Applying workaround: remove/re-add OIDC provider to force reconciliation..."
+
+            # Remove OIDC provider
+            printf '[{"op":"replace","path":"/spec/oidcProviders","value":[]}]' > /tmp/oidc-remove-$CLUSTER_NAME.json
+            kubectl --kubeconfig="$MANAGED_KUBECONFIG" patch authentication.config.openshift.io/cluster \
+                --type=json -p="$(cat /tmp/oidc-remove-$CLUSTER_NAME.json)"
+            sleep 10
+
+            # Re-add OIDC provider
+            kubectl --kubeconfig="$MANAGED_KUBECONFIG" patch authentication.config.openshift.io/cluster \
+                --type=json -p="$(cat /tmp/oidc-patch-$CLUSTER_NAME.json)"
+            echo "  ✅ OIDC provider re-applied"
+
+            # Wait for new revision again
+            for j in $(seq 1 12); do
+                sleep 5
+                CURRENT_REV=$(kubectl --kubeconfig="$MANAGED_KUBECONFIG" get kubeapiserver cluster \
+                    -o jsonpath='{.status.latestAvailableRevision}' 2>/dev/null || echo "0")
+                if [ "$CURRENT_REV" -gt "$BEFORE_REV" ]; then
+                    echo "  ✅ New revision $CURRENT_REV created after workaround"
+                    break
+                fi
+            done
+        fi
+    done
+
+    echo ""
+    echo "  ⚠️  IMPORTANT: kube-apiserver will now roll out with OIDC configuration"
+    echo "  This takes 10-15 minutes as each master node updates sequentially."
+    echo ""
+    echo "  You can monitor the rollout with:"
+    echo "    kubectl --kubeconfig=$MANAGED_KUBECONFIG get co kube-apiserver -w"
+    echo ""
+    echo "  Wait until: Available=True, Progressing=False, Degraded=False"
+fi
+
+echo ""
+echo "========================================="
+echo "✅ Managed Cluster Registration Complete!"
+echo "========================================="
+echo ""
+echo "Cluster: $CLUSTER_NAME"
+echo "Managed Realm: $MANAGED_REALM"
+echo "Identity Provider: $IDP_ALIAS (hub realm)"
+echo "Federated User: $MCP_USERNAME (hub: $HUB_USER_ID → managed: $MANAGED_USER_ID)"
+echo "Cross-Realm Exchange: Configured"
+echo "OIDC Authentication: Configured (rolling out)"
+echo ""
+echo "Configuration saved to: $CLUSTER_CONFIG_DIR/$CLUSTER_NAME.env"
+echo ""
+echo "⚠️  IMPORTANT: Wait for both rollouts to complete:"
+echo "  1. Feature gate rollout: ~10-15 minutes"
+echo "  2. OIDC rollout: ~10-15 minutes"
+echo "  Total: ~25-30 minutes"
+echo ""
+echo "After rollout completes:"
+echo "  1. Run: make keycloak-acm-generate-toml"
+echo "  2. Start MCP server: ./kubernetes-mcp-server --config acm-kubeconfig.toml"
+echo ""
