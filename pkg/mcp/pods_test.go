@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -85,6 +86,24 @@ func (s *PodsSuite) TestPodsListInAllNamespacesUnauthorized() {
 	}, metav1.CreateOptions{})
 	// Deny cluster by removing cluster rule
 	_ = client.RbacV1().ClusterRoles().Delete(s.T().Context(), "allow-all", metav1.DeleteOptions{})
+	// Wait for RBAC changes to propagate through the API server's authorizer cache
+	s.Require().Eventually(func() bool {
+		review, err := client.AuthorizationV1().SelfSubjectAccessReviews().Create(
+			s.T().Context(),
+			&authv1.SelfSubjectAccessReview{
+				Spec: authv1.SelfSubjectAccessReviewSpec{
+					ResourceAttributes: &authv1.ResourceAttributes{
+						Verb:     "list",
+						Resource: "pods",
+						Version:  "v1",
+					},
+				},
+			},
+			metav1.CreateOptions{},
+		)
+		return err == nil && !review.Status.Allowed
+	}, 5*time.Second, 100*time.Millisecond,
+		"expected cluster-wide pod list to be denied after ClusterRole deletion")
 	s.Run("pods_list returns pods list for default namespace only", func() {
 		toolResult, err := s.CallTool("pods_list", map[string]interface{}{})
 		s.Run("no error", func() {
@@ -200,6 +219,24 @@ func (s *PodsSuite) TestPodsListForbidden() {
 	client := kubernetes.NewForConfigOrDie(envTestRestConfig)
 	// Remove all permissions - user will have forbidden access
 	_ = client.RbacV1().ClusterRoles().Delete(s.T().Context(), "allow-all", metav1.DeleteOptions{})
+	// Wait for RBAC changes to propagate through the API server's authorizer cache
+	s.Require().Eventually(func() bool {
+		review, err := client.AuthorizationV1().SelfSubjectAccessReviews().Create(
+			s.T().Context(),
+			&authv1.SelfSubjectAccessReview{
+				Spec: authv1.SelfSubjectAccessReviewSpec{
+					ResourceAttributes: &authv1.ResourceAttributes{
+						Verb:     "list",
+						Resource: "pods",
+						Version:  "v1",
+					},
+				},
+			},
+			metav1.CreateOptions{},
+		)
+		return err == nil && !review.Status.Allowed
+	}, 5*time.Second, 100*time.Millisecond,
+		"expected cluster-wide pod list to be denied after ClusterRole deletion")
 
 	s.Run("pods_list (forbidden)", func() {
 		capture := s.StartCapturingLogNotifications()

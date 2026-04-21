@@ -113,20 +113,29 @@ func TestMain(m *testing.M) {
 
 func restoreAuth(ctx context.Context) {
 	kubernetesAdmin := kubernetes.NewForConfigOrDie(envTest.Config)
-	// Authorization
-	_, _ = kubernetesAdmin.RbacV1().ClusterRoles().Update(ctx, &rbacv1.ClusterRole{
+	// Authorization - use create-or-update since tests may delete the ClusterRole
+	cr := &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{Name: "allow-all"},
 		Rules: []rbacv1.PolicyRule{{
 			Verbs:     []string{"*"},
 			APIGroups: []string{"*"},
 			Resources: []string{"*"},
 		}},
-	}, metav1.UpdateOptions{})
-	_, _ = kubernetesAdmin.RbacV1().ClusterRoleBindings().Update(ctx, &rbacv1.ClusterRoleBinding{
+	}
+	if _, err := kubernetesAdmin.RbacV1().ClusterRoles().Update(ctx, cr, metav1.UpdateOptions{}); err != nil {
+		_, _ = kubernetesAdmin.RbacV1().ClusterRoles().Create(ctx, cr, metav1.CreateOptions{})
+	}
+	crb := &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: "allow-all"},
 		Subjects:   []rbacv1.Subject{{Kind: "Group", Name: envTestUser.Groups[0]}},
 		RoleRef:    rbacv1.RoleRef{Kind: "ClusterRole", Name: "allow-all"},
-	}, metav1.UpdateOptions{})
+	}
+	if _, err := kubernetesAdmin.RbacV1().ClusterRoleBindings().Update(ctx, crb, metav1.UpdateOptions{}); err != nil {
+		_, _ = kubernetesAdmin.RbacV1().ClusterRoleBindings().Create(ctx, crb, metav1.CreateOptions{})
+	}
+	// Clean up any test-specific RBAC resources that may interfere with other tests
+	_ = kubernetesAdmin.RbacV1().Roles("default").Delete(ctx, "allow-pods-list", metav1.DeleteOptions{})
+	_ = kubernetesAdmin.RbacV1().RoleBindings("default").Delete(ctx, "allow-pods-list", metav1.DeleteOptions{})
 }
 
 func createTestData(ctx context.Context) {
